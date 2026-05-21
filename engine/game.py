@@ -1,6 +1,6 @@
 """
 Fullhouse Hackathon — No-Limit Texas Hold'em Game Engine v2.0
-6-max (up to 9), using eval7 (same library as MIT Pokerbots).
+6-max (up to 9), using eval7 when available (same library as MIT Pokerbots).
 
 Fixes in v2.0:
   - Correct side-pot computation (multiple all-in levels)
@@ -15,10 +15,41 @@ Fixes in v2.0:
   - Hand strength labels at showdown
 """
 
-import eval7
 import random
 from dataclasses import dataclass, field
 from typing import Optional
+
+try:
+    import eval7
+except ModuleNotFoundError:
+    eval7 = None
+
+if eval7 is None:
+    from treys import Card as TreysCard, Evaluator as TreysEvaluator
+
+    _treys_evaluator = TreysEvaluator()
+
+    def _card(code: str) -> str:
+        return code
+
+    def _evaluate(cards: list) -> int:
+        treys_cards = [TreysCard.new(str(c)) for c in cards]
+        # treys scores lower as stronger; negate so the existing max() logic
+        # keeps treating larger values as better hands, matching eval7.
+        return -_treys_evaluator.evaluate(treys_cards[2:], treys_cards[:2])
+
+    def _handtype(score: int) -> str:
+        rank_class = _treys_evaluator.get_rank_class(-score)
+        return _treys_evaluator.class_to_string(rank_class)
+else:
+    def _card(code: str):
+        return eval7.Card(code)
+
+    def _evaluate(cards: list) -> int:
+        return eval7.evaluate(cards)
+
+    def _handtype(score: int) -> str:
+        return str(eval7.handtype(score))
 
 # ---------------------------------------------------------------------------
 # Config
@@ -110,7 +141,7 @@ class PokerEngine:
         self.seed        = seed
 
         self.pot             = 0
-        self.community_cards = []          # list of eval7.Card
+        self.community_cards = []          # list of card objects/strings
         self.street          = "preflop"
         self.action_log      = []          # flat dicts (backwards-compat for bots)
         self.events          = []          # rich event log for replay
@@ -121,7 +152,7 @@ class PokerEngine:
         self._last_aggression_size = BIG_BLIND
 
         self._needs_to_act    = set()
-        self._deck_cards      = []         # list[eval7.Card] after shuffle
+        self._deck_cards      = []         # shuffled deck
         self._deck_idx        = 0
         self._starting_stacks = {}         # snapshot before hand starts
 
@@ -358,7 +389,7 @@ class PokerEngine:
         """Build and (optionally deterministic) shuffle a full 52-card deck."""
         ranks = "23456789TJQKA"
         suits = "shdc"
-        cards = [eval7.Card(r + s) for r in ranks for s in suits]
+        cards = [_card(r + s) for r in ranks for s in suits]
         if self.seed is not None:
             rng = random.Random(self.seed)
             rng.shuffle(cards)
@@ -422,7 +453,7 @@ class PokerEngine:
             return self._award_uncontested(contenders[0])
 
         scored = [
-            (eval7.evaluate(p.hole_cards + self.community_cards), p)
+            (_evaluate(p.hole_cards + self.community_cards), p)
             for p in contenders
         ]
 
@@ -430,7 +461,7 @@ class PokerEngine:
         hand_strengths = {}
         for score, p in scored:
             try:
-                hand_strengths[p.bot_id] = str(eval7.handtype(score))
+                hand_strengths[p.bot_id] = _handtype(score)
             except Exception:
                 hand_strengths[p.bot_id] = "unknown"
 
