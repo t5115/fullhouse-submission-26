@@ -20,6 +20,7 @@ DECK = [r + s for r in "23456789TJQKA" for s in "shdc"]
 
 OPP = defaultdict(lambda: defaultdict(int))
 SEEN = set()
+RAISED_HANDS = set()
 MOMENTUM = deque(maxlen=20)
 LAST_STACK = None
 
@@ -122,7 +123,7 @@ def texture(board):
     return clamp(wet, 0, 1), scary
 
 
-def draw_bonus(hole, board):
+def draw_info(hole, board):
     cards = hole + board
     suits = defaultdict(int)
     for c in cards:
@@ -131,8 +132,47 @@ def draw_bonus(hole, board):
     if 14 in rs:
         rs.add(1)
     fd = len(board) < 5 and max(suits.values()) >= 4
-    sd = any(len({lo, lo + 1, lo + 2, lo + 3, lo + 4} & rs) >= 4 for lo in range(1, 11))
-    return 0.30 if fd and sd else 0.18 if fd or sd else 0.0
+    sd = False
+    open_ended = False
+    gutshot = False
+    for lo in range(1, 11):
+        run = {lo, lo + 1, lo + 2, lo + 3, lo + 4}
+        have = len(run & rs)
+        if have >= 4:
+            sd = True
+            missing = list(run - rs)
+            if missing and missing[0] in (lo, lo + 4):
+                open_ended = True
+            else:
+                gutshot = True
+    top_board = max(vals(board), default=0)
+    overcards = sum(1 for r in vals(hole) if r > top_board) if len(board) == 3 else 0
+    if fd and sd:
+        bonus = 0.30
+    elif fd and open_ended:
+        bonus = 0.25
+    elif fd or open_ended:
+        bonus = 0.18
+    elif sd:
+        bonus = 0.12 if gutshot else 0.15
+    else:
+        bonus = 0.0
+    if overcards == 2:
+        bonus += 0.045
+    elif overcards == 1:
+        bonus += 0.025
+    return {
+        "bonus": min(0.34, bonus),
+        "flush": fd,
+        "straight": sd,
+        "open": open_ended,
+        "gutshot": gutshot,
+        "overcards": overcards,
+    }
+
+
+def draw_bonus(hole, board):
+    return draw_info(hole, board)["bonus"]
 
 
 def update(state):
@@ -151,8 +191,11 @@ def update(state):
         SEEN.add(key)
         if len(SEEN) > 900:
             SEEN.clear()
+        hand = e.get("hand_num")
         bid = e.get("bot_id")
         if not bid or bid == me:
+            if e.get("action") in ("raise", "all_in"):
+                RAISED_HANDS.add(hand)
             continue
         a = e.get("action")
         st = OPP[bid]
@@ -163,8 +206,18 @@ def update(state):
             st["raises"] += 1
         if a == "call":
             st["calls"] += 1
+        if a == "check":
+            st["checks"] += 1
+        if a == "all_in":
+            st["allins"] += 1
+        if a in ("raise", "all_in"):
+            RAISED_HANDS.add(hand)
         if a == "fold":
             st["folds"] += 1
+            if hand in RAISED_HANDS:
+                st["fold_to_raise"] += 1
+        if len(RAISED_HANDS) > 120:
+            RAISED_HANDS.clear()
 
 
 def position(state):
@@ -189,6 +242,12 @@ def hand_num(state):
     for e in reversed(state.get("match_action_log", [])):
         if "hand_num" in e:
             return int(e["hand_num"])
+    hand_id = str(state.get("hand_id", ""))
+    if "_h" in hand_id:
+        try:
+            return int(hand_id.rsplit("_h", 1)[1])
+        except ValueError:
+            pass
     return 0
 
 
@@ -196,6 +255,7 @@ def table_profile(state):
     folds = []
     calls = []
     raises = []
+    fold_to_raises = []
     for p in state["players"]:
         st = OPP.get(p.get("bot_id"))
         if st and st["actions"] >= 5:
@@ -203,11 +263,32 @@ def table_profile(state):
             folds.append(st["folds"] / actions)
             calls.append(st["calls"] / actions)
             raises.append(st["raises"] / actions)
+            if st["folds"]:
+                fold_to_raises.append(st["fold_to_raise"] / max(1, st["folds"]))
     return (
         sum(folds) / len(folds) if folds else 0.33,
         sum(calls) / len(calls) if calls else 0.25,
         sum(raises) / len(raises) if raises else 0.18,
+        sum(fold_to_raises) / len(fold_to_raises) if fold_to_raises else 0.35,
     )
+
+
+def active_profile(state):
+    calls = []
+    raises = []
+    folds = []
+    for p in state["players"]:
+        if p["seat"] == state["seat_to_act"] or p.get("is_folded"):
+            continue
+        st = OPP.get(p.get("bot_id"))
+        if st and st["actions"] >= 5:
+            actions = max(1, st["actions"])
+            calls.append(st["calls"] / actions)
+            raises.append(st["raises"] / actions)
+            folds.append(st["folds"] / actions)
+    if not calls:
+        return 0.25, 0.18, 0.33
+    return sum(calls) / len(calls), sum(raises) / len(raises), sum(folds) / len(folds)
 
 
 def recent_pressure(state):
@@ -238,16 +319,22 @@ def risk_numbers(state, pos):
     avg = sum(stacks) / max(1, len(stacks))
     ratio = state["your_stack"] / max(1, avg)
     phase = clamp(hand_num(state) / 400.0, 0, 1)
-    foldy, cally, raisey = table_profile(state)
+    foldy, cally, raisey, fold_to_raise = table_profile(state)
+    active_call, active_raise, active_fold = active_profile(state)
     heat, _, _ = recent_pressure(state)
     mom = sum(MOMENTUM) / START
     agg = 0.42 + pos * 0.13 + phase * 0.12 + clamp(ratio - 1, -1, 2) * 0.14
     agg += foldy * 0.13 + clamp(mom, -1, 1) * 0.09
-    fe = 0.38 + foldy * 0.22 + pos * 0.11 + agg * 0.10 - cally * 0.07
+    fe = 0.36 + foldy * 0.18 + active_fold * 0.16 + fold_to_raise * 0.10
+    fe += pos * 0.11 + agg * 0.10 - cally * 0.05 - active_call * 0.12
     if state["amount_owed"] > 0:
-        fe -= 0.10 + raisey * 0.08 + heat * 0.18
+        fe -= 0.10 + raisey * 0.06 + active_raise * 0.10 + heat * 0.18
     opps = len([p for p in state["players"] if p["seat"] != state["seat_to_act"] and not p.get("is_folded")])
     fe -= max(0, opps - 1) * 0.07
+    if active_call > 0.40:
+        agg -= 0.04
+    if active_raise > 0.30:
+        agg -= 0.05
     if state["your_stack"] < 10 * BB:
         agg -= 0.08
     if heat > 0.55:
@@ -305,6 +392,8 @@ def preflop(state, pos, agg, fe):
     pressure = s + pos * 0.13 + fe * 0.15 + agg * 0.11
     stack_bb = state["your_stack"] / BB
 
+    if all_in and s < (0.70 if stack_bb <= 8 else 0.78):
+        return {"action": "fold"}
     if stack_bb <= 8 and pressure > 0.78:
         return {"action": "all_in"}
     if stack_bb <= 14 and pressure > 0.90 and heat < 0.45:
@@ -316,9 +405,6 @@ def preflop(state, pos, agg, fe):
                 mult = random.choice([2.35, 2.85, 3.45])
             return {"action": "raise", "amount": legal_raise(state, state["min_raise_to"] * mult)}
         return {"action": "check"}
-
-    if all_in and s < 0.78:
-        return {"action": "fold"}
 
     if s > 0.82:
         mult = random.choice([2.45, 3.10, 3.85])
@@ -349,15 +435,27 @@ def postflop(state, pos, agg, fe):
     if state["street"] == "river":
         sims += 160
     eq = equity(hole, board, opps, sims)
-    draw = draw_bonus(hole, board)
+    draws = draw_info(hole, board)
+    draw = draws["bonus"]
     owed = state["amount_owed"]
     pot = max(1, state["pot"])
     price = owed / max(1, pot + owed)
     heat, raise_count, all_in = recent_pressure(state)
     spr = state["your_stack"] / max(1, pot)
+    big_bet = owed > pot * 0.55 or owed > state["your_stack"] * 0.25
+    recent = state.get("action_log", [])[-10:]
+    hero = state["seat_to_act"]
+    hero_aggressed = any(a.get("seat") == hero and a.get("action") in ("raise", "all_in") for a in recent)
+    passive_line = not any(
+        a.get("seat") != hero and a.get("action") in ("raise", "all_in") for a in recent[-5:]
+    )
     bluff = fe * 0.45 + agg * 0.26 + pos * 0.13 + draw - wet * 0.12 - max(0, opps - 1) * 0.08
     if scary and pos > 0.45:
         bluff += 0.06
+    if hero_aggressed and state["street"] == "flop":
+        bluff += 0.07
+    if passive_line and pos > 0.40:
+        bluff += 0.04
     bluff -= heat * 0.22
     value_edge = eq - price
 
@@ -365,8 +463,11 @@ def postflop(state, pos, agg, fe):
         if cat >= 5 or eq > 0.78:
             return {"action": "raise", "amount": bet_size(state, "value", agg, wet)}
         if cat >= 2 or eq > 0.61:
-            return {"action": "raise", "amount": bet_size(state, "thin", agg, wet)} if random.random() < 0.66 else {"action": "check"}
-        if draw and bluff > 0.48:
+            freq = 0.58 + agg * 0.18 - wet * 0.10
+            return {"action": "raise", "amount": bet_size(state, "thin", agg, wet)} if random.random() < freq else {"action": "check"}
+        if (draws["flush"] or draws["open"]) and bluff > 0.48:
+            return {"action": "raise", "amount": bet_size(state, "semi", agg, wet)}
+        if draws["gutshot"] and bluff > 0.62 and opps <= 2:
             return {"action": "raise", "amount": bet_size(state, "semi", agg, wet)}
         if opps <= 2 and bluff > 0.60 and random.random() < bluff * 0.50:
             return {"action": "raise", "amount": bet_size(state, "bluff", agg, wet)}
@@ -384,14 +485,22 @@ def postflop(state, pos, agg, fe):
     if all_in and eq < 0.66:
         return {"action": "fold"}
 
+    if state["street"] == "river" and big_bet and cat < 2 and eq < 0.58:
+        return {"action": "fold"}
+
     if cat >= 2 and value_edge > 0.10 + heat * 0.06:
         if eq > 0.70 and fe > 0.35 and heat < 0.52 and random.random() < agg * 0.45:
             return {"action": "raise", "amount": bet_size(state, "thin", agg, wet)}
         return {"action": "call"}
 
-    if draw and eq + draw > price + 0.05 + heat * 0.04 and owed < state["your_stack"] * 0.30:
-        if bluff > 0.62 and raise_count == 0 and random.random() < 0.42:
+    strong_draw = draws["flush"] or draws["open"]
+    marginal_draw = draws["straight"] or draws["overcards"] == 2
+    if strong_draw and eq + draw > price + 0.04 + heat * 0.04 and owed < state["your_stack"] * 0.32:
+        if bluff > 0.60 and raise_count == 0 and random.random() < 0.42 + agg * 0.10:
             return {"action": "raise", "amount": bet_size(state, "semi", agg, wet)}
+        return {"action": "call"}
+
+    if marginal_draw and eq + draw > price + 0.08 + heat * 0.05 and owed < state["your_stack"] * 0.18:
         return {"action": "call"}
 
     if bluff > 0.73 and opps == 1 and owed < state["your_stack"] * 0.18 and raise_count == 0 and random.random() < 0.32:
